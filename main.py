@@ -1,172 +1,219 @@
-import os, sqlite3, smtplib, json
-from datetime import datetime, timezone
-from email.message import EmailMessage
-from pathlib import Path
 
+import os
+import sqlite3
 import requests
 import yfinance as yf
 import pandas as pd
+from datetime import datetime, timezone
 
-DB = Path("signals.db")
-BINANCE = "https://api.binance.com/api/v3/klines"
+# =========================
+# AI INVESTMENT BOT V2
+# Stocks + Crypto
+# =========================
 
-STOCKS = [x.strip() for x in os.getenv("STOCK_SYMBOLS", "AAPL,MSFT,NVDA,TSLA,SPY,QQQ").split(",") if x.strip()]
-CRYPTOS = [x.strip().upper() for x in os.getenv("CRYPTO_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT").split(",") if x.strip()]
+DB_NAME = "signals.db"
 
-def indicators(df):
-    close = df["close"]
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+STOCKS = ["AAPL", "MSFT", "NVDA", "TSLA", "SPY", "QQQ"]
+CRYPTOS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+
+def setup_database():
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                market TEXT,
+                price REAL,
+                rsi REAL,
+                score INTEGER,
+                action TEXT,
+                created_at TEXT
+            )
+        """)
+
+
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = -delta.clip(upper=0).rolling(period).mean()
     rs = gain / loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + rs))
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
-    return float(rsi.iloc[-1]), float(macd.iloc[-1]), float(signal.iloc[-1]), float(ema20.iloc[-1]), float(ema50.iloc[-1])
+    return 100 - (100 / (1 + rs))
 
-def assess(symbol, market, df):
+
+def analyze_data(symbol, market, df):
     if df is None or len(df) < 60:
         return None
-    rsi, macd, macd_sig, ema20, ema50 = indicators(df)
-    price = float(df["close"].iloc[-1])
-    volume = float(df["volume"].iloc[-1])
-    avgvol = float(df["volume"].tail(20).mean())
+
+    close = df["Close"].dropna()
+
+    if len(close) < 60:
+        return None
+
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    rsi = calculate_rsi(close)
+
+    latest_price = float(close.iloc[-1])
+    latest_rsi = float(rsi.iloc[-1])
     score = 0
-    reasons = []
-    if price > ema20 > ema50:
-        score += 2; reasons.append("cijena iznad EMA20 i EMA50")
-    elif price < ema20 < ema50:
-        score -= 2; reasons.append("cijena ispod EMA20 i EMA50")
-    if macd > macd_sig:
-        score += 1; reasons.append("MACD iznad signalne linije")
+
+    if ema20.iloc[-1] > ema50.iloc[-1]:
+        score += 2
     else:
-        score -= 1; reasons.append("MACD ispod signalne linije")
-    if 50 <= rsi <= 68:
-        score += 1; reasons.append(f"RSI {rsi:.1f}: pozitivan momentum")
-    elif rsi >= 75:
-        score -= 1; reasons.append(f"RSI {rsi:.1f}: moguć prekupljen nivo")
-    elif rsi <= 30:
-        score += 1; reasons.append(f"RSI {rsi:.1f}: moguć preprodan nivo")
-    if avgvol and volume > avgvol * 1.3:
-        reasons.append("volumen iznad prosjeka")
-        score += 1 if score > 0 else 0
+        score -= 2
+
+    if latest_rsi < 30:
+        score += 2
+    elif latest_rsi > 70:
+        score -= 2
+
+    if latest_price > ema20.iloc[-1]:
+        score += 1
+    else:
+        score -= 1
 
     if score >= 3:
         action = "BUY WATCH"
     elif score <= -3:
-        action = "SELL / AVOID"
+        action = "SELL WATCH"
     else:
         action = "HOLD"
-    # This is a transparent indicator score, NOT a calibrated probability.
-    confidence = min(85, 50 + abs(score) * 7)
+
     return {
-        "symbol": symbol, "market": market, "price": price,
-        "action": action, "score": score, "confidence": confidence,
-        "rsi": rsi, "reasons": "; ".join(reasons)
+        "symbol": symbol,
+        "market": market,
+        "price": latest_price,
+        "rsi": latest_rsi,
+        "score": score,
+        "action": action
     }
 
-def get_crypto(symbol):
-    r = requests.get(BINANCE, params={"symbol": symbol, "interval": "1h", "limit": 120}, timeout=20)
-    r.raise_for_status()
-    rows = r.json()
-    df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","close_time","quote_volume","trades","taker_base","taker_quote","ignore"])
-    for col in ["open","high","low","close","volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
 
-def get_stock(symbol):
-    raw = yf.download(symbol, period="60d", interval="1h", progress=False, auto_adjust=True, threads=False)
-    if raw is None or raw.empty:
+def get_stock_data(symbol):
+    try:
+        df = yf.download(
+            symbol,
+            period="6mo",
+            interval="1h",
+            progress=False,
+            auto_adjust=True
+        )
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df
+    except Exception as error:
+        print(f"Stock error {symbol}: {error}")
         return None
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = raw.columns.get_level_values(0)
-    df = raw.rename(columns={"Close":"close","Volume":"volume"})
-    return df[["close","volume"]].dropna()
 
-def init_db():
-    with sqlite3.connect(DB) as con:
-        con.execute("""CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY, ts TEXT, symbol TEXT, market TEXT,
-            action TEXT, score INTEGER, price REAL, confidence INTEGER,
-            UNIQUE(symbol, market, action, score)
-        )""")
 
-def notify_telegram(message):
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if token and chat_id:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      json={"chat_id": chat_id, "text": message}, timeout=20).raise_for_status()
+def get_crypto_data(symbol):
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        params = {
+            "symbol": symbol,
+            "interval": "1h",
+            "limit": 200
+        }
+        response = requests.get(url, params=params, timeout=20)
+        response.raise_for_status()
+        rows = response.json()
 
-def notify_email(subject, body):
-    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USER")
-    password = os.getenv("SMTP_APP_PASSWORD")
-    recipient = os.getenv("EMAIL_TO")
-    if not all([user, password, recipient]):
+        df = pd.DataFrame(rows, columns=[
+            "time", "Open", "High", "Low", "Close", "Volume",
+            "close_time", "quote_volume", "trades",
+            "taker_buy_base", "taker_buy_quote", "ignore"
+        ])
+
+        for column in ["Open", "High", "Low", "Close", "Volume"]:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+        return df
+
+    except Exception as error:
+        print(f"Crypto error {symbol}: {error}")
+        return None
+
+
+def save_signal(signal):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            INSERT INTO signals
+            (symbol, market, price, rsi, score, action, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            signal["symbol"],
+            signal["market"],
+            signal["price"],
+            signal["rsi"],
+            signal["score"],
+            signal["action"],
+            datetime.now(timezone.utc).isoformat()
+        ))
+
+
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram nije konfigurisan.")
         return
-    msg = EmailMessage()
-    msg["Subject"], msg["From"], msg["To"] = subject, user, recipient
-    msg.set_content(body)
-    with smtplib.SMTP(host, port, timeout=20) as server:
-        server.starttls()
-        server.login(user, password)
-        server.send_message(msg)
+
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        response = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=20
+        )
+        response.raise_for_status()
+    except Exception as error:
+        print(f"Telegram notification error: {error}")
+
+
+def send_email(message):
+    # Email se dodaje u sljedećem koraku kroz GitHub Secrets.
+    print("Email konfiguracija još nije dodana.")
+
 
 def main():
-    init_db()
+    setup_database()
     results = []
-    errors = []
+
     for symbol in STOCKS:
-        try:
-            item = assess(symbol, "DIONICE / ETF", get_stock(symbol))
-            if item: results.append(item)
-        except Exception as e:
-            errors.append(f"{symbol}: {e}")
+        df = get_stock_data(symbol)
+        signal = analyze_data(symbol, "STOCK", df)
+        if signal:
+            results.append(signal)
+
     for symbol in CRYPTOS:
-        try:
-            item = assess(symbol, "KRIPTO", get_crypto(symbol))
-            if item: results.append(item)
-        except Exception as e:
-            errors.append(f"{symbol}: {e}")
+        df = get_crypto_data(symbol)
+        signal = analyze_data(symbol, "CRYPTO", df)
+        if signal:
+            results.append(signal)
 
-    now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
-    lines = [f"AI INVESTMENT BOT — {now}", "Satni pregled; signali su informativni, ne nalog za trgovanje.", ""]
-    new_signals = []
-    with sqlite3.connect(DB) as con:
-        for x in results:
-            lines.append(f"{x['market']} | {x['symbol']} | {x['action']} | cijena {x['price']:.6g} | score {x['score']} | RSI {x['rsi']:.1f}")
-            lines.append(f"  Razlozi: {x['reasons']}")
-            exists = con.execute("SELECT 1 FROM signals WHERE symbol=? AND market=? AND action=? AND score=?",
-                                 (x["symbol"], x["market"], x["action"], x["score"])).fetchone()
-            if not exists and x["action"] != "HOLD":
-                new_signals.append(x)
-            con.execute("INSERT OR IGNORE INTO signals(ts,symbol,market,action,score,price,confidence) VALUES(?,?,?,?,?,?,?)",
-                        (now, x["symbol"], x["market"], x["action"], x["score"], x["price"], x["confidence"]))
-    if errors:
-        lines += ["", "GREŠKE / NEDOSTUPNI PODACI:"] + errors
-    report = "\n".join(lines)
-    print(report)
+    if not results:
+        print("Nema dostupnih podataka za analizu.")
+        return
 
-    # Send the full hourly report by email; Telegram only sends new non-HOLD signals.
-    try:
-        notify_email("AI Investment Bot — satni izvještaj", report)
-    except Exception as e:
-        print("Email slanje nije uspjelo:", e)
-    if new_signals:
-        msg = "NOVI INVESTICIJSKI SIGNALI\n" + "\n".join(
-            f"{x['symbol']} ({x['market']}): {x['action']} | cijena {x['price']:.6g} | score {x['score']}\n{x['reasons']}"
-            for x in new_signals
+    for signal in results:
+        save_signal(signal)
+
+        message = (
+            f"{signal['market']} | {signal['symbol']}\n"
+            f"Cijena: {signal['price']:.6f}\n"
+            f"RSI: {signal['rsi']:.2f}\n"
+            f"Ocjena: {signal['score']}\n"
+            f"Signal: {signal['action']}\n"
+            "Informativna analiza, nije garancija profita."
         )
-        try:
-            notify_telegram(msg)
-        except Exception as e:
-            print("Telegram slanje nije uspjelo:", e)
+
+        print(message)
+        send_telegram(message)
+
+    print(f"Analiza završena. Ukupno signala: {len(results)}")
+
 
 if __name__ == "__main__":
     main()
