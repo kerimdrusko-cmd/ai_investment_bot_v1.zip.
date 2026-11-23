@@ -1,0 +1,41 @@
+
+name: AI Investment Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Preuzmi kod
+        uses: actions/checkout@v4
+
+      - name: Postavi Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instaliraj biblioteke
+        run: |
+          pip install yfinance pandas requests
+
+      - name: Pokreni investicioni bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
+
+      - name: Sačuvaj historiju signala
+        run: |
+          git config user.name "AI Investment Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add signals.db
+          git diff --cached --quiet || git commit -m "Update investment signals"
+          git push
